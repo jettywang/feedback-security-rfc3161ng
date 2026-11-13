@@ -26,6 +26,11 @@ __all__ = (
 
 id_attribute_messageDigest = univ.ObjectIdentifier((1, 2, 840, 113549, 1, 9, 4))
 
+# RFC 3161: only PKIStatus 0 (granted) is a TimeStampToken issued exactly as
+# requested. grantedWithMods (1) and the other statuses are not accepted as a
+# successful timestamp because the token may not be bound to the original request.
+PKI_STATUS_GRANTED = 0
+
 
 def get_hash_oid(hashname):
     return rfc3161ng.__dict__['id_' + hashname]
@@ -197,6 +202,29 @@ def check_timestamp(tst, certificate=None, data=None, digest=None, hashname=None
     return True
 
 
+def describe_pki_status(status_info):
+    '''
+       Build a human readable description of a PKIStatusInfo so that failure
+       details (numeric status, status name, free text and failure bits) are
+       preserved in the raised error instead of being lost.
+    '''
+    status = int(status_info['status'])
+    status_name = rfc3161ng.PKIStatus.namedValues.getName(status)
+    details = ['PKIStatus %d (%s)' % (status, status_name or 'unknown')]
+    status_string = status_info['statusString']
+    if status_string.hasValue():
+        details.append('statusString=%r' % ([str(text) for text in status_string],))
+    fail_info = status_info['failInfo']
+    if fail_info.hasValue():
+        fail_names = [
+            rfc3161ng.PKIFailureInfo.namedValues.getName(index)
+            for index, bit in enumerate(fail_info)
+            if bit
+        ]
+        details.append('failInfo=%s' % (','.join(name for name in fail_names if name) or bytes(fail_info),))
+    return '; '.join(details)
+
+
 class RemoteTimestamper(object):
     def __init__(self, url, certificate=None, capath=None, cafile=None, username=None, password=None, hashname=None, include_tsa_certificate=False, timeout=10, tsa_policy_id=None):
         self.url = url
@@ -210,12 +238,47 @@ class RemoteTimestamper(object):
         self.timeout = timeout
         self.tsa_policy_id = tsa_policy_id
 
-    def check_response(self, response, digest, nonce=None):
+    def check_response(self, response, digest, nonce=None, policy=None):
         '''
-           Check validity of a TimeStampResponse
+           Check that a TimeStampResponse is a successful reply bound to the
+           original request.
+
+           The HTTP layer succeeding does not mean the TSA granted the
+           request: the PKIStatus, the requested policy, the nonce and the
+           messageImprint are all verified against the request. These
+           association checks run even when no TSA certificate was supplied;
+           the certificate only narrows the cryptographic trust by enabling
+           signature verification. Any failure raises TimestampingError and no
+           token bytes are returned, so a rejection can never be archived as a
+           valid timestamp.
         '''
+        status_info = response['status']
+        if int(status_info['status']) != PKI_STATUS_GRANTED:
+            raise TimestampingError('TSA did not grant the timestamp request: %s' % describe_pki_status(status_info))
+        if not response.time_stamp_token.hasValue():
+            raise TimestampingError('granted PKIStatus without a TimeStampToken: %s' % describe_pki_status(status_info))
         tst = response.time_stamp_token
+        tst_info = tst.tst_info
+
+        if policy is not None:
+            requested_policy = univ.ObjectIdentifier(policy)
+            if not tst_info.policy.hasValue() or tst_info.policy != requested_policy:
+                raise TimestampingError(
+                    'TSTInfo policy does not match the requested policy %s' % requested_policy
+                )
+
+        if nonce is not None:
+            if not tst_info['nonce'].hasValue() or int(tst_info['nonce']) != int(nonce):
+                raise TimestampingError('TSTInfo nonce is missing or does not match the request nonce')
+
+        message_imprint = tst_info.message_imprint
+        if message_imprint.hash_algorithm[0] != get_hash_oid(self.hashname) or bytes(message_imprint.hashed_message) != digest:
+            raise TimestampingError('TSTInfo messageImprint does not match the requested digest')
+
         if self.certificate:
+            # Signature/certificate trust is a separate concern from the
+            # request association checks above and is only available when a TSA
+            # certificate has been provided.
             return self.check(tst, digest=digest, nonce=nonce)
         return tst
 
@@ -242,13 +305,14 @@ class RemoteTimestamper(object):
         if data:
             digest = data_to_digest(data, self.hashname)
 
+        policy_id = tsa_policy_id if tsa_policy_id is not None else self.tsa_policy_id
         request = make_timestamp_request(
             data=data,
             digest=digest,
             hashname=self.hashname,
             include_tsa_certificate=include_tsa_certificate if include_tsa_certificate is not None else self.include_tsa_certificate,
             nonce=nonce,
-            tsa_policy_id=tsa_policy_id if tsa_policy_id is not None else self.tsa_policy_id
+            tsa_policy_id=policy_id
         )
         binary_request = encode_timestamp_request(request)
 
@@ -271,7 +335,7 @@ class RemoteTimestamper(object):
         except requests.RequestException as exc:
             raise TimestampingError('Unable to send the request to %r' % self.url, exc)
         tsr = decode_timestamp_response(response.content)
-        self.check_response(tsr, digest, nonce=nonce)
+        self.check_response(tsr, digest, nonce=nonce, policy=policy_id)
         if return_tsr:
             return tsr
         return encoder.encode(tsr.time_stamp_token)
