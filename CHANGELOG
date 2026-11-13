@@ -1,6 +1,18 @@
 Changelog
 =========
 
+2.1.4
+-----
+
+ - fix: select the signer certificate from the SignerInfo SignerIdentifier and
+   the ESS signingCertificate/signingCertificateV2 binding instead of assuming
+   the first embedded certificate is the TSA
+ - verify every SignerInfo rather than only the first one
+ - raise SignerNotFoundError when no unique signer certificate can be bound and
+   InvalidSignatureError when the located signer's signature does not verify,
+   so "signer not found" is distinguishable from "invalid signature"
+
+
 2.1.3
 -----
 

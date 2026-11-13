@@ -7,24 +7,33 @@ import dateutil.relativedelta
 import dateutil.tz
 
 from pyasn1.codec.der import encoder, decoder
-from pyasn1_modules import rfc2459
-from pyasn1.type import univ
+from pyasn1_modules import rfc2459, rfc2634, rfc5035
+from pyasn1.type import univ, tag
 from pyasn1.error import PyAsn1Error
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.asymmetric import padding
-from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.exceptions import InvalidSignature
 
 import rfc3161ng
 
 __all__ = (
     'RemoteTimestamper', 'check_timestamp', 'get_hash_oid',
-    'TimestampingError', 'get_timestamp', 'make_timestamp_request',
+    'TimestampingError', 'SignerNotFoundError', 'InvalidSignatureError',
+    'get_timestamp', 'make_timestamp_request',
     'encode_timestamp_request', 'encode_timestamp_response',
     'decode_timestamp_request', 'decode_timestamp_response',
 )
 
 id_attribute_messageDigest = univ.ObjectIdentifier((1, 2, 840, 113549, 1, 9, 4))
+
+# ESS signingCertificate / signingCertificateV2 signed-attribute OIDs
+id_aa_signingCertificate = rfc2634.id_aa_signingCertificate
+id_aa_signingCertificateV2 = rfc5035.id_aa_signingCertificateV2
+
+# SubjectKeyIdentifier (SKI) choice tag of CMS SignerIdentifier (RFC 5652)
+_sid_ski_tag = tag.Tag(tag.tagClassContext, tag.tagFormatSimple, 0)
 
 
 def get_hash_oid(hashname):
@@ -45,6 +54,19 @@ def get_hash_class_from_oid(oid):
 
 class TimestampingError(RuntimeError):
     pass
+
+
+class SignerNotFoundError(TimestampingError):
+    '''No certificate could be bound to a SignerInfo.
+
+    The signer certificate is missing, ambiguous (several certificates match
+    the SignerInfo identity / signingCertificate binding), or none of them
+    matches the ESS signingCertificate digest.
+    '''
+
+
+class InvalidSignatureError(TimestampingError):
+    '''A signer was located, but its cryptographic verification failed.'''
 
 
 def generalizedtime_to_utc_datetime(gt, naive=True):
@@ -109,20 +131,206 @@ def get_timestamp(tst, naive=True):
         raise ValueError('not a valid TimeStampToken', exc)
 
 
-def load_certificate(signed_data, certificate=b""):
-    backend = default_backend()
-
-    if certificate == b"":
-        try:
-            certificate = signed_data['certificates'][0][0]
-        except (KeyError, IndexError, TypeError):
-            raise AttributeError("missing certificate")
-        data = encoder.encode(certificate)
-        return x509.load_der_x509_certificate(data, backend)
-
+def _load_certificate_bytes(certificate, backend=None):
+    backend = backend or default_backend()
     if b'-----BEGIN CERTIFICATE-----' in certificate:
         return x509.load_pem_x509_certificate(certificate, backend)
     return x509.load_der_x509_certificate(certificate, backend)
+
+
+def load_certificate(signed_data, certificate=b""):
+    '''Load a single certificate from raw bytes or from the token.
+
+    Selecting the first embedded certificate is not safe on its own: the
+    certificate order inside a TimeStampToken is not fixed. Prefer
+    :func:`select_signer_certificate`, which binds a certificate to a
+    specific SignerInfo. This helper is kept for backwards compatibility.
+    '''
+    backend = default_backend()
+
+    if certificate == b"" or certificate is None:
+        try:
+            embedded = signed_data['certificates']
+            if not embedded.hasValue() or not len(embedded):
+                raise AttributeError("missing certificate")
+            certificate = embedded[0][0]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise AttributeError("missing certificate") from exc
+        data = encoder.encode(certificate)
+        return x509.load_der_x509_certificate(data, backend)
+
+    return _load_certificate_bytes(certificate, backend)
+
+
+def _embedded_certificates(signed_data):
+    '''Return the X.509 certificates embedded in a SignedData as crypto objects.'''
+    certificates = []
+    try:
+        embedded = signed_data['certificates']
+    except (KeyError, IndexError, TypeError):
+        return certificates
+    if not embedded.hasValue():
+        return certificates
+    for choice in embedded:
+        # index 0 is the X.509 certificate; index 1 is an obsolete
+        # extendedCertificate (CMS only carries plain X.509 certificates).
+        if choice.hasValue() and choice.getName() == 'certificate':
+            data = encoder.encode(choice[0])
+            certificates.append(x509.load_der_x509_certificate(data, default_backend()))
+    return certificates
+
+
+def _certificate_subject_key_identifier(certificate):
+    try:
+        extension = certificate.extensions.get_extension_for_class(x509.SubjectKeyIdentifier)
+    except x509.ExtensionNotFound:
+        return None
+    return extension.value.digest
+
+
+def _signer_identifier(signer_info):
+    '''Return ``(kind, value)`` for a CMS SignerIdentifier.
+
+    ``kind`` is either ``'issuerSerial'`` (issuer Name + serial number, the
+    PKCS#7/CMS default) or ``'ski'`` (context-tagged [0] subject key
+    identifier, RFC 5652).
+    '''
+    sid = signer_info['issuerAndSerialNumber']
+    if sid.tagSet[-1] == _sid_ski_tag:
+        return 'ski', bytes(sid)
+    return 'issuerSerial', sid
+
+
+def _certificate_matches_sid(certificate, sid_kind, sid_value):
+    if sid_kind == 'ski':
+        ski = _certificate_subject_key_identifier(certificate)
+        return ski is not None and ski == sid_value
+    try:
+        serial_number = int(sid_value['serialNumber'])
+    except (ValueError, OverflowError):
+        return False
+    return encoder.encode(sid_value['issuer']) == certificate.issuer.public_bytes() \
+        and certificate.serial_number == serial_number
+
+
+def _decode_ess_cert_ids(signer_info):
+    '''Extract ESS signingCertificate(V2) bindings from authenticatedAttributes.
+
+    Returns a list of ``(hash_name, cert_digest, issuer_serial)`` tuples, one
+    per ESSCertID(V2) carried by the token (usually a single entry).
+    '''
+    bindings = []
+    try:
+        authenticated_attributes = signer_info['authenticatedAttributes']
+    except (KeyError, IndexError, TypeError):
+        return bindings
+    for attribute in authenticated_attributes:
+        oid = attribute[0]
+        raw_value = bytes(attribute[1][0])
+        if oid == id_aa_signingCertificate:
+            sc, substrate = decoder.decode(raw_value, asn1Spec=rfc2634.SigningCertificate())
+            if substrate:
+                raise ValueError('extra data after signingCertificate attribute')
+            for cert_id in sc['certs']:
+                issuer_serial = cert_id['issuerSerial'] if cert_id['issuerSerial'].hasValue() else None
+                bindings.append(('sha1', bytes(cert_id['certHash']), issuer_serial))
+        elif oid == id_aa_signingCertificateV2:
+            sc, substrate = decoder.decode(raw_value, asn1Spec=rfc5035.SigningCertificateV2())
+            if substrate:
+                raise ValueError('extra data after signingCertificateV2 attribute')
+            for cert_id in sc['certs']:
+                hash_oid = cert_id['hashAlgorithm']['algorithm']
+                hash_name = get_hash_from_oid(hash_oid)
+                issuer_serial = cert_id['issuerSerial'] if cert_id['issuerSerial'].hasValue() else None
+                bindings.append((hash_name, bytes(cert_id['certHash']), issuer_serial))
+    return bindings
+
+
+def _certificate_matches_ess(certificate, bindings):
+    if not bindings:
+        return True
+    for hash_name, expected_digest, issuer_serial in bindings:
+        digest = hashes.Hash(getattr(hashes, hash_name.upper())(), default_backend())
+        digest.update(certificate.public_bytes(serialization.Encoding.DER))
+        if digest.finalize() != expected_digest:
+            return False
+        if issuer_serial is not None:
+            general_names = issuer_serial['issuer']
+            serial_number = int(issuer_serial['serialNumber'])
+            if serial_number != certificate.serial_number:
+                return False
+            if not _issuer_name_matches(certificate, general_names):
+                return False
+    return True
+
+
+def _issuer_name_matches(certificate, general_names):
+    # IssuerSerial.issuer is a GeneralNames sequence; only directoryName
+    # entries (tag [4]) are meaningful for X.509 issuer comparison.
+    for general_name in general_names:
+        if general_name.getName() != 'directoryName':
+            continue
+        if encoder.encode(general_name.getComponent()) == certificate.issuer.public_bytes():
+            return True
+    return False
+
+
+def select_signer_certificate(signer_info, candidates, certificate=None):
+    '''Bind a certificate to ``signer_info`` and return it.
+
+    ``candidates`` are the certificates embedded in the SignedData; the
+    optional explicit ``certificate`` is a cryptography X.509 object supplied
+    by the caller. Selection follows the SignerInfo SignerIdentifier and, when
+    present, the ESS signingCertificate / signingCertificateV2 digest binding.
+
+    When a certificate is supplied explicitly it is the only one considered:
+    it must match the SignerInfo identity and its ESS binding, otherwise the
+    signer is considered not found. Without an explicit certificate the
+    embedded ``candidates`` are searched, and zero or several matches both
+    raise :class:`SignerNotFoundError` rather than silently picking one.
+    '''
+    sid_kind, sid_value = _signer_identifier(signer_info)
+    try:
+        bindings = _decode_ess_cert_ids(signer_info)
+    except (PyAsn1Error, ValueError) as exc:
+        raise SignerNotFoundError('malformed signingCertificate(V2) attribute: %s' % exc)
+
+    if certificate is not None:
+        pool = [certificate]
+        explicit = True
+    else:
+        pool = list(candidates)
+        explicit = False
+
+    matches = []
+    seen = set()
+    for candidate in pool:
+        der_bytes = candidate.public_bytes(serialization.Encoding.DER)
+        if der_bytes in seen:
+            continue
+        seen.add(der_bytes)
+        if not _certificate_matches_sid(candidate, sid_kind, sid_value):
+            continue
+        if not _certificate_matches_ess(candidate, bindings):
+            continue
+        matches.append(candidate)
+
+    if not matches:
+        if explicit:
+            raise SignerNotFoundError(
+                'the supplied certificate does not match the SignerInfo '
+                'identity or its signingCertificate(V2) binding'
+            )
+        raise SignerNotFoundError(
+            'no certificate matching the SignerInfo identity and '
+            'signingCertificate(V2) binding was found'
+        )
+    if len(matches) > 1:
+        raise SignerNotFoundError(
+            'several certificates match the SignerInfo identity; the '
+            'signingCertificate(V2) binding does not identify a unique one'
+        )
+    return matches[0]
 
 
 def check_timestamp(tst, certificate=None, data=None, digest=None, hashname=None, nonce=None):
@@ -139,25 +347,37 @@ def check_timestamp(tst, certificate=None, data=None, digest=None, hashname=None
         if substrate:
             raise ValueError("extra data after tst")
     signed_data = tst.content
-    certificate = load_certificate(signed_data, certificate)
     if nonce is not None and int(tst.tst_info['nonce']) != int(nonce):
         raise ValueError('nonce is different or missing')
     # check message imprint with respect to locally computed digest
     message_imprint = tst.tst_info.message_imprint
     if message_imprint.hash_algorithm[0] != get_hash_oid(hashname) or bytes(message_imprint.hashed_message) != digest:
         raise ValueError('Message imprint mismatch')
-    if not len(signed_data['signerInfos']):
-        raise ValueError('No signature')
-    # We validate only one signature
-    signer_info = signed_data['signerInfos'][0]
+    signer_infos = signed_data['signerInfos']
+    if not len(signer_infos):
+        raise SignerNotFoundError('No signature: the token has no SignerInfo')
     # check content type
     if tst.content['contentInfo']['contentType'] != rfc3161ng.id_ct_TSTInfo:
         raise ValueError("Signed content type is wrong: %s != %s" % (
             tst.content['contentInfo']['contentType'], rfc3161ng.id_ct_TSTInfo
         ))
 
+    explicit_certificate = _load_certificate_bytes(certificate) if certificate else None
+    embedded = _embedded_certificates(signed_data)
+
+    # Every SignerInfo must verify; never silently validate only the first one.
+    for signer_info in signer_infos:
+        signer_certificate = select_signer_certificate(
+            signer_info, embedded, certificate=explicit_certificate
+        )
+        _verify_signer_info(signer_info, signer_certificate, tst)
+    return True
+
+
+def _verify_signer_info(signer_info, certificate, tst):
+    signed_data = tst.content
     # check signed data digest
-    content = bytes(decoder.decode(bytes(tst.content['contentInfo']['content']), asn1Spec=univ.OctetString())[0])
+    content = bytes(decoder.decode(bytes(signed_data['contentInfo']['content']), asn1Spec=univ.OctetString())[0])
     # if there is authenticated attributes, they must contain the message
     # digest and they are the signed data otherwise the content is the
     # signed data
@@ -172,29 +392,35 @@ def check_timestamp(tst, certificate=None, data=None, digest=None, hashname=None
                 try:
                     signed_digest = bytes(decoder.decode(bytes(authenticated_attribute[1][0]), asn1Spec=univ.OctetString())[0])
                     if signed_digest != content_digest:
-                        raise ValueError('Content digest != signed digest')
+                        raise InvalidSignatureError('Content digest != signed digest')
                     s = univ.SetOf()
                     for i, x in enumerate(authenticated_attributes):
                         s.setComponentByPosition(i, x)
-                    signed_data = encoder.encode(s)
+                    signed_payload = encoder.encode(s)
                     break
                 except PyAsn1Error:
                     raise
         else:
-            raise ValueError('No signed digest')
+            raise InvalidSignatureError('No signed digest')
     else:
-        signed_data = content
+        signer_digest_algorithm = signer_info['digestAlgorithm']['algorithm']
+        signer_hash_name = get_hash_from_oid(signer_digest_algorithm)
+        signed_payload = content
     # check signature
     signature = signer_info['encryptedDigest']
     public_key = certificate.public_key()
     hash_family = getattr(hashes, signer_hash_name.upper())
-    public_key.verify(
-        bytes(signature),
-        signed_data,
-        padding.PKCS1v15(),
-        hash_family(),
-    )
-    return True
+    try:
+        public_key.verify(
+            bytes(signature),
+            signed_payload,
+            padding.PKCS1v15(),
+            hash_family(),
+        )
+    except InvalidSignature:
+        raise InvalidSignatureError(
+            'signature does not verify against the signer certificate'
+        )
 
 
 class RemoteTimestamper(object):
