@@ -12,6 +12,7 @@ from .api import (
     TimestampingError, get_timestamp, make_timestamp_request,
     encode_timestamp_request, encode_timestamp_response,
     decode_timestamp_request, decode_timestamp_response,
+    data_to_digest, resolve_digest,
 )
 
 __all__ = (
@@ -28,6 +29,7 @@ __all__ = (
     'TimestampingError', 'get_timestamp', 'make_timestamp_request',
     'encode_timestamp_request', 'encode_timestamp_response',
     'decode_timestamp_request', 'decode_timestamp_response',
+    'data_to_digest', 'resolve_digest',
 )
 
 VERSION = '2.1.4-dev'

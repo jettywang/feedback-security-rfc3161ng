@@ -22,6 +22,7 @@ __all__ = (
     'TimestampingError', 'get_timestamp', 'make_timestamp_request',
     'encode_timestamp_request', 'encode_timestamp_response',
     'decode_timestamp_request', 'decode_timestamp_response',
+    'data_to_digest', 'resolve_digest',
 )
 
 id_attribute_messageDigest = univ.ObjectIdentifier((1, 2, 840, 113549, 1, 9, 4))
@@ -127,12 +128,7 @@ def load_certificate(signed_data, certificate=b""):
 
 def check_timestamp(tst, certificate=None, data=None, digest=None, hashname=None, nonce=None):
     hashname = hashname or 'sha1'
-    hashobj = hashlib.new(hashname)
-    if digest is None:
-        if not data:
-            raise ValueError("check_timestamp requires data or digest argument")
-        hashobj.update(data)
-        digest = hashobj.digest()
+    digest = resolve_digest(data=data, digest=digest, hashname=hashname)
 
     if not isinstance(tst, rfc3161ng.TimeStampToken):
         tst, substrate = decoder.decode(tst, asn1Spec=rfc3161ng.TimeStampToken())
@@ -239,11 +235,10 @@ class RemoteTimestamper(object):
         )
 
     def __call__(self, data=None, digest=None, include_tsa_certificate=None, nonce=None, return_tsr=False, tsa_policy_id=None):
-        if data:
-            digest = data_to_digest(data, self.hashname)
+        digest = resolve_digest(data=data, digest=digest, hashname=self.hashname)
 
         request = make_timestamp_request(
-            data=data,
+            data=None,
             digest=digest,
             hashname=self.hashname,
             include_tsa_certificate=include_tsa_certificate if include_tsa_certificate is not None else self.include_tsa_certificate,
@@ -285,18 +280,37 @@ def data_to_digest(data, hashname='sha1'):
     return hashobj.digest()
 
 
+def resolve_digest(data=None, digest=None, hashname='sha1'):
+    '''Resolve the message imprint digest from the given arguments.
+
+    The same rules apply to every entry point (``make_timestamp_request``,
+    ``RemoteTimestamper`` and ``check_timestamp``):
+
+    * a precomputed ``digest`` always wins, even when ``data`` is also given;
+    * otherwise ``data`` (which may be empty, e.g. an empty file) is hashed
+      with ``hashname``;
+    * a precomputed digest must have exactly the size produced by
+      ``hashname`` so the algorithm OID can never disagree with the digest;
+    * at least one of ``data`` or ``digest`` must be provided.
+    '''
+    hashobj = hashlib.new(hashname)
+    if digest is not None:
+        if len(digest) != hashobj.digest_size:
+            raise ValueError(
+                'digest length is wrong %s != %s for hash %r' % (
+                    len(digest), hashobj.digest_size, hashname))
+        return bytes(digest)
+    if data is None:
+        raise ValueError('You must pass some data to digest, or the digest')
+    return data_to_digest(data, hashname)
+
+
 def make_timestamp_request(data=None, digest=None, hashname='sha1', include_tsa_certificate=False, nonce=None, tsa_policy_id=None):
     algorithm_identifier = rfc2459.AlgorithmIdentifier()
     algorithm_identifier.setComponentByPosition(0, get_hash_oid(hashname))
     message_imprint = rfc3161ng.MessageImprint()
     message_imprint.setComponentByPosition(0, algorithm_identifier)
-    hashobj = hashlib.new(hashname)
-    if digest:
-        assert len(digest) == hashobj.digest_size, 'digest length is wrong %s != %s' % (len(digest), hashobj.digest_size)
-    elif data:
-        digest = data_to_digest(data)
-    else:
-        raise ValueError('You must pass some data to digest, or the digest')
+    digest = resolve_digest(data=data, digest=digest, hashname=hashname)
     message_imprint.setComponentByPosition(1, digest)
     tsq = rfc3161ng.TimeStampReq()
     tsq.setComponentByPosition(0, 'v1')
