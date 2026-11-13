@@ -1,6 +1,18 @@
 Changelog
 =========
 
+2.1.4
+-----
+
+ - Verify timestamp signatures with PyCA using the CMS algorithm identifiers
+   instead of always using RSA PKCS#1 v1.5. Adds RSA-PSS (hash, MGF1 hash
+   and salt length from RSASSA-PSS-params) and ECDSA (DER ECDSA-Sig-Value)
+   support while keeping legacy RSA timestamp tokens working. Unknown
+   signature or digest algorithms now raise UnsupportedAlgorithmError.
+ - Support SHA-224.
+ - Support both signed-attribute and direct-content signature forms.
+
+
 2.1.3
 -----
 

@@ -60,6 +60,26 @@ Example for a server that insist on SHA256:
     >>> tsr = timestamper(data=b'The RedWax Project', return_tsr=True)
     >>> print('{}'.format(tsr))
 
+Verifying timestamps
+====================
+
+Timestamp verification is driven by the algorithm identifiers carried in
+the CMS ``SignerInfo``:
+
+ * RSA PKCS#1 v1.5 (``rsaEncryption`` and the ``*WithRSAEncryption``
+   identifiers), which keeps older RSA timestamp tokens working;
+ * RSA-PSS (``id-RSASSA-PSS``), honouring the hash algorithm, MGF1 hash
+   algorithm and salt length from ``RSASSA-PSS-params`` (with the RFC 4055
+   defaults when parameters are absent);
+ * ECDSA (the ``ecdsa-with-*`` identifiers), accepting the DER
+   ``ECDSA-Sig-Value`` signature format used by CMS.
+
+Both signer forms are supported: signatures over the signed attributes
+(which must include ``messageDigest``) and signatures over the
+``TSTInfo`` content directly. An unrecognised signature or digest
+algorithm raises ``rfc3161ng.UnsupportedAlgorithmError`` instead of
+falling back to another algorithm.
+
 Verifying timestamp using OpenSSL
 =================================
 

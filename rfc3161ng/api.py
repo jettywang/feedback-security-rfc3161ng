@@ -7,34 +7,67 @@ import dateutil.relativedelta
 import dateutil.tz
 
 from pyasn1.codec.der import encoder, decoder
-from pyasn1_modules import rfc2459
+from pyasn1_modules import rfc2459, rfc3279, rfc4055
 from pyasn1.type import univ
 from pyasn1.error import PyAsn1Error
 from cryptography import x509
+from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
 from cryptography.hazmat.primitives import hashes
 
 import rfc3161ng
 
 __all__ = (
     'RemoteTimestamper', 'check_timestamp', 'get_hash_oid',
-    'TimestampingError', 'get_timestamp', 'make_timestamp_request',
-    'encode_timestamp_request', 'encode_timestamp_response',
-    'decode_timestamp_request', 'decode_timestamp_response',
+    'TimestampingError', 'UnsupportedAlgorithmError', 'get_timestamp',
+    'make_timestamp_request', 'encode_timestamp_request',
+    'encode_timestamp_response', 'decode_timestamp_request',
+    'decode_timestamp_response',
 )
 
 id_attribute_messageDigest = univ.ObjectIdentifier((1, 2, 840, 113549, 1, 9, 4))
 
+_HASH_CLASSES = {
+    'sha1': hashes.SHA1,
+    'sha224': hashes.SHA224,
+    'sha256': hashes.SHA256,
+    'sha384': hashes.SHA384,
+    'sha512': hashes.SHA512,
+}
+
+# RSA PKCS#1 v1.5 signature algorithm identifiers.  Legacy time-stamp
+# tokens commonly use rsaEncryption without naming a digest; newer ones
+# may use the combined digestWithRSAEncryption identifiers.
+_RSA_PKCS1_SIGNATURE_OIDS = {
+    rfc3161ng.id_rsaEncryption: None,
+    rfc3161ng.id_sha1WithRSAEncryption: 'sha1',
+    rfc3161ng.id_sha224WithRSAEncryption: 'sha224',
+    rfc3161ng.id_sha256WithRSAEncryption: 'sha256',
+    rfc3161ng.id_sha384WithRSAEncryption: 'sha384',
+    rfc3161ng.id_sha512WithRSAEncryption: 'sha512',
+}
+
+_ECDSA_SIGNATURE_OIDS = {
+    rfc3161ng.id_ecdsa_with_SHA1: 'sha1',
+    rfc3161ng.id_ecdsa_with_SHA224: 'sha224',
+    rfc3161ng.id_ecdsa_with_SHA256: 'sha256',
+    rfc3161ng.id_ecdsa_with_SHA384: 'sha384',
+    rfc3161ng.id_ecdsa_with_SHA512: 'sha512',
+}
+
 
 def get_hash_oid(hashname):
-    return rfc3161ng.__dict__['id_' + hashname]
+    try:
+        return rfc3161ng.__dict__['id_' + hashname]
+    except KeyError:
+        raise UnsupportedAlgorithmError('unsupported hash algorithm: %s' % (hashname,))
 
 
 def get_hash_from_oid(oid):
     h = rfc3161ng.oid_to_hash.get(oid)
     if h is None:
-        raise ValueError('unsupported hash algorithm', oid)
+        raise UnsupportedAlgorithmError('unsupported hash algorithm: %s' % (oid,))
     return h
 
 
@@ -43,7 +76,19 @@ def get_hash_class_from_oid(oid):
     return getattr(hashlib, h)
 
 
+def get_pyca_hash(hashname):
+    try:
+        return _HASH_CLASSES[hashname]
+    except KeyError:
+        raise UnsupportedAlgorithmError('unsupported hash algorithm: %s' % (hashname,))
+
+
 class TimestampingError(RuntimeError):
+    pass
+
+
+class UnsupportedAlgorithmError(ValueError):
+    '''Raised when a CMS algorithm identifier is not supported.'''
     pass
 
 
@@ -125,6 +170,150 @@ def load_certificate(signed_data, certificate=b""):
     return x509.load_der_x509_certificate(certificate, backend)
 
 
+def _decode_pss_params(parameters):
+    '''Decode RSASSA-PSS-params, applying the RFC 4055 defaults.
+
+    Returns a (hash name, MGF1 hash name, salt length) tuple.
+    '''
+    if parameters is None:
+        raw_parameters = b''
+    else:
+        try:
+            raw_parameters = bytes(parameters)
+        except PyAsn1Error:
+            # No value present for the optional parameters field.
+            raw_parameters = b''
+
+    if not raw_parameters:
+        pss_params = rfc4055.RSASSA_PSS_params()
+    else:
+        try:
+            pss_params, substrate = decoder.decode(
+                raw_parameters, asn1Spec=rfc4055.RSASSA_PSS_params())
+        except PyAsn1Error as exc:
+            raise ValueError('invalid RSASSA-PSS parameters', exc)
+        if substrate:
+            raise ValueError('extra data after RSASSA-PSS parameters')
+
+    # RFC 4055 section 3.1: hashAlgorithm defaults to SHA-1,
+    # maskGenAlgorithm defaults to MGF1 with SHA-1 and saltLength to 20.
+    hash_algorithm = pss_params['hashAlgorithm']
+    if hash_algorithm.isValue:
+        hash_oid = hash_algorithm['algorithm']
+    else:
+        hash_oid = rfc3161ng.id_sha1
+
+    mask_gen_algorithm = pss_params['maskGenAlgorithm']
+    if mask_gen_algorithm.isValue:
+        mgf_oid = mask_gen_algorithm['algorithm']
+        if mgf_oid != rfc3161ng.id_mgf1:
+            raise UnsupportedAlgorithmError(
+                'unsupported mask generation function: %s' % (mgf_oid,))
+        mgf_hash_oid = mask_gen_algorithm['parameters']
+        if not mgf_hash_oid.isValue or not bytes(mgf_hash_oid):
+            raise ValueError('missing MGF1 hash algorithm')
+        try:
+            mgf_hash_algorithm, substrate = decoder.decode(
+                bytes(mgf_hash_oid), asn1Spec=rfc4055.HashAlgorithm())
+        except PyAsn1Error as exc:
+            raise ValueError('invalid MGF1 parameters', exc)
+        if substrate:
+            raise ValueError('extra data after MGF1 parameters')
+        mgf_hash_oid = mgf_hash_algorithm['algorithm']
+    else:
+        mgf_hash_oid = rfc3161ng.id_sha1
+
+    if pss_params['trailerField'] != 1:
+        raise UnsupportedAlgorithmError(
+            'unsupported RSASSA-PSS trailer field: %s' % (pss_params['trailerField'],))
+
+    salt_length = int(pss_params['saltLength']) if pss_params['saltLength'].isValue else 20
+
+    return get_hash_from_oid(hash_oid), get_hash_from_oid(mgf_hash_oid), salt_length
+
+
+def _decode_ecdsa_signature(signature):
+    '''Normalize a CMS ECDSA signature to a canonical DER ECDSA-Sig-Value.
+
+    CMS carries ECDSA signatures as DER encoded ECDSA-Sig-Value (RFC 5753),
+    not as the raw fixed-width r || s concatenation expected by some APIs.
+    '''
+    try:
+        ecdsa_signature, substrate = decoder.decode(
+            signature, asn1Spec=rfc3279.ECDSA_Sig_Value())
+    except PyAsn1Error as exc:
+        raise ValueError('invalid ECDSA signature format', exc)
+    if substrate:
+        raise ValueError('invalid ECDSA signature format: trailing data')
+    if int(ecdsa_signature['r']) <= 0 or int(ecdsa_signature['s']) <= 0:
+        raise ValueError('invalid ECDSA signature format: non-positive value')
+    return encoder.encode(ecdsa_signature)
+
+
+def _verify_signature(signer_info, signed_data, public_key):
+    '''Verify a CMS SignerInfo signature using its algorithm identifier.'''
+    digest_oid = signer_info['digestAlgorithm']['algorithm']
+    digest_hash_name = get_hash_from_oid(digest_oid)
+    signature_oid = signer_info['digestEncryptionAlgorithm']['algorithm']
+    signature = bytes(signer_info['encryptedDigest'])
+
+    if signature_oid == rfc3161ng.id_RSASSA_PSS:
+        if not isinstance(public_key, rsa.RSAPublicKey):
+            raise ValueError('RSASSA-PSS signature requires an RSA public key')
+        pss_hash_name, mgf_hash_name, salt_length = _decode_pss_params(
+            signer_info['digestEncryptionAlgorithm']['parameters'])
+        # RFC 4055 section 3.1: the PSS hash must be the digest algorithm
+        # used to compute the signed attributes (or the content digest).
+        if pss_hash_name != digest_hash_name:
+            raise ValueError(
+                'RSASSA-PSS hash algorithm mismatch: %s != %s'
+                % (pss_hash_name, digest_hash_name))
+        public_key.verify(
+            signature,
+            signed_data,
+            padding.PSS(
+                mgf=padding.MGF1(get_pyca_hash(mgf_hash_name)()),
+                salt_length=salt_length,
+            ),
+            get_pyca_hash(pss_hash_name)(),
+        )
+        return
+
+    if signature_oid in _RSA_PKCS1_SIGNATURE_OIDS:
+        if not isinstance(public_key, rsa.RSAPublicKey):
+            raise ValueError('RSA signature requires an RSA public key')
+        explicit_hash_name = _RSA_PKCS1_SIGNATURE_OIDS[signature_oid]
+        if explicit_hash_name is not None and explicit_hash_name != digest_hash_name:
+            raise ValueError(
+                'signature hash algorithm mismatch: %s != %s'
+                % (explicit_hash_name, digest_hash_name))
+        public_key.verify(
+            signature,
+            signed_data,
+            padding.PKCS1v15(),
+            get_pyca_hash(explicit_hash_name or digest_hash_name)(),
+        )
+        return
+
+    if signature_oid in _ECDSA_SIGNATURE_OIDS:
+        if not isinstance(public_key, ec.EllipticCurvePublicKey):
+            raise ValueError('ECDSA signature requires an EC public key')
+        explicit_hash_name = _ECDSA_SIGNATURE_OIDS[signature_oid]
+        if explicit_hash_name is not None and explicit_hash_name != digest_hash_name:
+            raise ValueError(
+                'signature hash algorithm mismatch: %s != %s'
+                % (explicit_hash_name, digest_hash_name))
+        public_key.verify(
+            _decode_ecdsa_signature(signature),
+            signed_data,
+            ec.ECDSA(get_pyca_hash(explicit_hash_name or digest_hash_name)()),
+        )
+        return
+
+    raise UnsupportedAlgorithmError(
+        'unsupported signature algorithm: %s' % (signature_oid,))
+
+
 def check_timestamp(tst, certificate=None, data=None, digest=None, hashname=None, nonce=None):
     hashname = hashname or 'sha1'
     hashobj = hashlib.new(hashname)
@@ -165,7 +354,6 @@ def check_timestamp(tst, certificate=None, data=None, digest=None, hashname=None
         authenticated_attributes = signer_info['authenticatedAttributes']
         signer_digest_algorithm = signer_info['digestAlgorithm']['algorithm']
         signer_hash_class = get_hash_class_from_oid(signer_digest_algorithm)
-        signer_hash_name = get_hash_from_oid(signer_digest_algorithm)
         content_digest = signer_hash_class(content).digest()
         for authenticated_attribute in authenticated_attributes:
             if authenticated_attribute[0] == id_attribute_messageDigest:
@@ -185,15 +373,11 @@ def check_timestamp(tst, certificate=None, data=None, digest=None, hashname=None
     else:
         signed_data = content
     # check signature
-    signature = signer_info['encryptedDigest']
     public_key = certificate.public_key()
-    hash_family = getattr(hashes, signer_hash_name.upper())
-    public_key.verify(
-        bytes(signature),
-        signed_data,
-        padding.PKCS1v15(),
-        hash_family(),
-    )
+    try:
+        _verify_signature(signer_info, signed_data, public_key)
+    except InvalidSignature:
+        raise ValueError('Signature verification failed')
     return True
 
 
